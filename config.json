@@ -1,0 +1,16 @@
+{
+  "date": "2026-11-06",
+  "from_station": "kameoka",
+  "to_station": "arashiyama",
+  "departure": "09:30",
+  "passengers": { "adult": 5, "child": 0 },
+  "seat_rule": {
+    "even_rows_only": true,
+    "seat_letters": ["A", "D"],
+    "cars": [1, 2, 3, 4, 5],
+    "prefer_same_car": true
+  },
+  "poll_interval_sec": 1.0,
+  "poll_timeout_min": 15,
+  "start_before_open_sec": 5
+}
