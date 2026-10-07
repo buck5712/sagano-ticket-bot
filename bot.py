@@ -377,6 +377,32 @@ def fill_participant(page, profile: dict) -> bool:
     return True
 
 
+def confirm_booking(page) -> bool:
+    """按「予約を確定する」（建立訂單、保留座位，還不會扣款），等到「お支払い」步驟。
+    同意條款的勾選和付款都留給本人。"""
+    page.get_by_role("button", name="予約を確定する").click()
+    try:
+        page.get_by_role("button", name="支払いへ").wait_for(timeout=20000)
+        return True
+    except Exception:
+        return False
+
+
+def agree_and_go_to_payment(page) -> bool:
+    """勾選「上記を読んだ上で同意しました」→ 按「支払いへ」，停在信用卡輸入頁（不填卡號、不付款）。"""
+    page.get_by_text("上記を読んだ上で同意しました").click()
+    btn = page.get_by_role("button", name="支払いへ")
+    btn.wait_for()
+    if btn.is_disabled():
+        return False
+    btn.click()
+    try:
+        page.wait_for_url("**payment.linktivity.io/**", timeout=20000, wait_until="commit")
+        return True
+    except Exception:
+        return False
+
+
 def open_manual_seat_page(page, cfg):
     """手動備援：一樣先走商品頁（付款頁才有訂票資料），再停在選位頁讓你自己點。"""
     try:
@@ -432,21 +458,48 @@ def cmd_check(cfg):
         print("  付款頁網址：", booking_url(cfg, svc["id"], chosen))
 
 
+CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    str(Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe"),
+]
+
+
 def open_browser():
+    """用「一般方式」啟動 Chrome，再讓 Playwright 連上去操作。
+    不用 Playwright 自己啟動，是因為它會加 --no-sandbox 等自動化參數，
+    導致信用卡 3D 驗證視窗載不出來（一片空白）。付款必須在同一個分頁完成，訂單才會成立。"""
+    import socket
+    import subprocess
     from playwright.sync_api import sync_playwright
 
+    chrome = next((c for c in CHROME_PATHS if Path(c).exists()), None)
+    if not chrome:
+        sys.exit("找不到 Google Chrome，請先安裝。")
+    with socket.socket() as sock:  # 找一個空的 port 給遠端控制用
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    proc = subprocess.Popen([
+        chrome, f"--remote-debugging-port={port}", f"--user-data-dir={ROOT / 'browser-profile'}",
+        "--no-first-run", "--no-default-browser-check", "--lang=ja", "--window-size=1100,950",
+        "about:blank",
+    ])
+
     pw = sync_playwright().start()
-    kwargs = dict(user_data_dir=str(ROOT / "browser-profile"), headless=False,
-                  viewport={"width": 1100, "height": 900}, locale="ja-JP")
-    try:
-        ctx = pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
-    except Exception as chrome_err:
+    browser = None
+    for _ in range(30):  # 等 Chrome 開好
         try:
-            ctx = pw.chromium.launch_persistent_context(**kwargs)
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            break
         except Exception:
-            pw.stop()
-            sys.exit("無法開啟 Chrome。常見原因：上一次開的瀏覽器視窗還沒關（browser-profile 被占用），"
-                     f"請先關掉再試一次。\n原始錯誤：{chrome_err}")
+            if proc.poll() is not None:
+                break
+            time.sleep(0.5)
+    if not browser:
+        pw.stop()
+        sys.exit("無法連上 Chrome。常見原因：上一次開的程式瀏覽器視窗還沒關（browser-profile 被占用），"
+                 "請先關掉再試一次。")
+    ctx = browser.contexts[0]
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return pw, ctx, page
 
@@ -454,10 +507,19 @@ def open_browser():
 def wait_for_close(ctx):
     print("瀏覽器關閉後腳本結束（或按 Ctrl+C）。")
     try:
-        while ctx.pages:
+        while ctx.browser.is_connected() and ctx.pages:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
+
+
+def close_browser(pw, ctx):
+    try:
+        if ctx.browser.is_connected():
+            ctx.browser.close()
+    except Exception:
+        pass
+    pw.stop()
 
 
 def cmd_login(cfg):
@@ -466,8 +528,7 @@ def cmd_login(cfg):
     print("請在打開的瀏覽器裡「自己」登入（Google / Facebook / Email）。")
     print("登入完成後直接關閉瀏覽器，登入狀態會保存在 browser-profile/。")
     wait_for_close(ctx)
-    ctx.close()
-    pw.stop()
+    close_browser(pw, ctx)
 
 
 def cmd_run(cfg):
@@ -532,21 +593,44 @@ def cmd_run(cfg):
             if ok:
                 break
         if ok:
+            filled = False
             try:
-                if fill_participant(page, load_profile()):
+                filled = fill_participant(page, load_profile())
+                if filled:
                     print("  已填入姓名（profile.json）")
             except Exception as e:
                 print("  自動填姓名失敗，請自己填：", str(e).splitlines()[0])
-            print("\n>>> 已開到付款頁。請在瀏覽器裡確認：日期、班次、座位、人數（大人/小孩），")
-            print(">>> 然後由你自己勾選同意並完成付款。付款完成才算正式訂到座位。")
+            confirmed = False
+            if filled and cfg.get("auto_confirm"):
+                try:
+                    confirmed = confirm_booking(page)
+                except Exception as e:
+                    print("  自動按「予約を確定する」失敗：", str(e).splitlines()[0])
+                print("  已按「予約を確定する」，座位保留中" if confirmed
+                      else "  沒有成功進到「お支払い」，請看瀏覽器畫面")
+            to_payment = False
+            if confirmed and cfg.get("auto_agree_and_proceed"):
+                try:
+                    to_payment = agree_and_go_to_payment(page)
+                except Exception as e:
+                    print("  自動勾選同意 / 按「支払いへ」失敗：", str(e).splitlines()[0])
+            if to_payment:
+                print("\n>>> 訂單已建立、座位保留中（還沒扣款），已開到信用卡付款頁。")
+                print(">>> 請在「這個瀏覽器、這個分頁」填卡號、按「支払う」並完成銀行驗證，")
+                print(">>> 最後出現綠色大勾勾才算預約完成。不要換到別的瀏覽器付款，訂單會無法成立。")
+                print(">>> 付款期限內沒付，座位會被釋放。")
+            elif confirmed:
+                print("\n>>> 已建立訂單、保留座位（還沒扣款）。請在瀏覽器裡：")
+                print(">>> 確認金額 → 勾選「上記を読んだ上で同意しました」→ 按「支払いへ」→ 自己付款。")
+                print(">>> 付款期限內沒付款，座位會被釋放。")
+            else:
+                print("\n>>> 已開到付款頁。請在瀏覽器裡確認：日期、班次、座位、人數（大人/小孩），")
+                print(">>> 然後由你自己勾選同意並完成付款。付款完成才算正式訂到座位。")
         else:
             print("\n自動選位沒有成功，改開官方選位頁，請手動選位。")
             open_manual_seat_page(page, cfg)
     wait_for_close(ctx)
-    try:
-        ctx.close()
-    finally:
-        pw.stop()
+    close_browser(pw, ctx)
 
 
 def main():
