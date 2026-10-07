@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -53,6 +54,9 @@ def load_config() -> dict:
     cfg["total"] = int(p.get("adult", 0)) + int(p.get("child", 0))
     if not 1 <= cfg["total"] <= 8:
         sys.exit("每筆訂單人數需為 1~8 人")
+    groups = cfg["seat_rule"].get("seat_groups")
+    if groups and sum(len(g) for g in groups) != cfg["total"]:
+        sys.exit(f"seat_groups 的座位總數 ({sum(len(g) for g in groups)}) 要等於人數 ({cfg['total']})")
     return cfg
 
 
@@ -122,7 +126,9 @@ class Seat:
 
 
 def candidate_seats(cfg, inv: dict) -> list[Seat]:
+    """可用車廂裡的空位。用 seat_groups 時回傳全部空位（單雙排、座位字母由 pick_seat_groups 處理）。"""
     rule = cfg["seat_rule"]
+    use_groups = bool(rule.get("seat_groups"))
     out = []
     for car in inv.get("car_inventories", []):
         car_no = int(car["physical_car_id"])
@@ -131,17 +137,92 @@ def candidate_seats(cfg, inv: dict) -> list[Seat]:
         for a in car.get("arrangements", []):
             if a.get("arrangement_state") != "ARRANGEABLE" or a.get("reservation_state") != "VACANT":
                 continue
-            row = int(a["seat_group_id"])
-            if rule.get("even_rows_only") and row % 2:
+            if not str(a.get("seat_group_id", "")).isdigit():  # 例如輪椅席 "wheelchair"
                 continue
-            if a["seat_id"] not in rule["seat_letters"]:
+            row = int(a["seat_group_id"])
+            if not use_groups and rule.get("even_rows_only") and row % 2:
+                continue
+            if not use_groups and a["seat_id"] not in rule["seat_letters"]:
                 continue
             out.append(Seat(car_no, car["logical_car_id"], row, a["seat_id"], a["arrangement_type_id"]))
     return out
 
 
+def pick_seat_groups(cfg, seats: list[Seat]) -> list[Seat] | None:
+    """依 seat_groups 挑座位：每組要在「同一排」湊齊指定座位，例如 [["A","C","D"], ["A","D"]]。
+    各組分在不同排。優先順序：
+      1. 雙數排（even_rows_only=true 時只用雙數排；allow_odd_rows_fallback=true 時湊不齊才用奇數排）
+      2. 同一節車廂（prefer_same_car）
+      3. 排數越大越好（prefer_high_rows）
+      4. car_priority 排越前面的車廂越好，例如 [4, 3, 2, 1]
+      5. 排與排越近越好
+    都湊不齊、且 allow_any_seats_fallback=true 時，改挑任意空位（pick_any_seats）。"""
+    rule = cfg["seat_rule"]
+    groups = rule["seat_groups"]
+    car_rank = car_ranks(rule)
+    high_rows = rule.get("prefer_high_rows", False)
+    allow_odd = not rule.get("even_rows_only") or rule.get("allow_odd_rows_fallback")
+    rows: dict[tuple[int, int], dict[str, Seat]] = {}
+    for s in seats:
+        if s.row % 2 and not allow_odd:
+            continue
+        rows.setdefault((s.car, s.row), {})[s.letter] = s
+
+    # 每一組可以放在哪些排
+    fits = [[k for k, v in rows.items() if all(l in v for l in g)] for g in groups]
+
+    best = None
+
+    def search(i, used, picked):
+        nonlocal best
+        if i == len(groups):
+            cars = {k[0] for k in picked}
+            nums = [k[1] for k in picked]
+            score = (sum(n % 2 for n in nums),
+                     len(cars) if rule.get("prefer_same_car", True) else 0,
+                     sorted(-n for n in nums) if high_rows else [],
+                     sorted(car_rank.get(c, 99) for c in cars),
+                     max(nums) - min(nums), min(picked))
+            if best is None or score < best[0]:
+                best = (score, list(picked))
+            return
+        for k in fits[i]:
+            if k not in used:
+                search(i + 1, used | {k}, picked + [k])
+
+    search(0, frozenset(), [])
+    if best:
+        return [rows[k][l] for k, g in zip(best[1], groups) for l in g]
+    if rule.get("allow_any_seats_fallback"):
+        print("  湊不齊指定的座位組合，改挑任意空位")
+        return pick_any_seats(cfg, seats)
+    return None
+
+
+def car_ranks(rule) -> dict[int, int]:
+    return {c: i for i, c in enumerate(rule.get("car_priority") or sorted(rule["cars"]))}
+
+
+def pick_any_seats(cfg, seats: list[Seat]) -> list[Seat] | None:
+    """任意空位：優先同一節車廂（依 car_priority），排數越大越好。"""
+    n = cfg["total"]
+    if len(seats) < n:
+        return None
+    rank = car_ranks(cfg["seat_rule"])
+    key = lambda s: (-s.row, s.letter)
+    by_car: dict[int, list[Seat]] = {}
+    for s in seats:
+        by_car.setdefault(s.car, []).append(s)
+    for car in sorted(by_car, key=lambda c: rank.get(c, 99)):
+        if len(by_car[car]) >= n:
+            return sorted(by_car[car], key=key)[:n]
+    return sorted(seats, key=lambda s: (-s.row, rank.get(s.car, 99), s.letter))[:n]
+
+
 def pick_seats(cfg, seats: list[Seat]) -> list[Seat] | None:
     """挑 N 個座位：優先同一節車廂、排數越集中越好。"""
+    if cfg["seat_rule"].get("seat_groups"):
+        return pick_seat_groups(cfg, seats)
     n = cfg["total"]
     if len(seats) < n:
         return None
@@ -185,6 +266,126 @@ def manual_seat_url(cfg) -> str:
         f"&backUrl={quote(BOOKING_SITE + '/activity/ja/LINKTIVITY-YRBTL', safe='')}"
         f"&redirectUrl={quote(BOOKING_SITE + '/booking/pay', safe='')}&currentStep=station"
     )
+
+
+ACTIVITY_URL = f"{BOOKING_SITE}/activity/ja/LINKTIVITY-YRBTL"
+
+
+def prepare_booking_session(page, cfg) -> bool:
+    """在商品頁自動選「日期 → 方向 → 人數 → 予約手続きへ」。
+    付款頁需要這一步存在 sessionStorage 的訂票資料（同一分頁才有效），沒有的話會被導回首頁。"""
+    target = date.fromisoformat(cfg["date"])
+    page.goto(ACTIVITY_URL, wait_until="domcontentloaded")  # 不等大圖片載完
+    # 視窗寬時日曆會並排顯示兩個月，所以找出標題是目標月份的那一個
+    month_label = f"{target.month}月 {target.year}"
+    page.locator("[class*=DateTable_dateTableCurrent]").first.wait_for(timeout=15000)
+    month_table = page.locator("[class*=DateTable_dateTable_]").filter(
+        has=page.locator("[class*=DateTable_dateTableCurrent]", has_text=month_label))
+    for _ in range(3):
+        if month_table.count():
+            break
+        page.locator("[class*=DateTable_dateTableNext]:visible").last.click()
+        page.wait_for_timeout(300)
+    else:
+        print("  商品頁找不到月份", month_label)
+        return False
+
+    day_btn = month_table.first.locator("[class*=DateTable_dateTableDayButton]").filter(
+        has_text=re.compile(rf"^\s*{target.day}\s*$"))
+    if not day_btn.count() or day_btn.first.is_disabled():
+        print(f"  商品頁的 {target.month}/{target.day} 還不能選（可能尚未開賣）")
+        return False
+    day_btn.first.click()
+
+    plan_text = "亀岡駅　→" if direction(cfg) == "up" else "嵯峨駅／嵐山駅　→"
+    page.locator("[class*=PlanPicker_planPicker]").filter(has_text=plan_text).first.click(timeout=10000)
+
+    rows = page.locator("[class*=SelectUnit_amount_]")
+    rows.first.wait_for(timeout=10000)
+    for idx, key in enumerate(("adult", "child")):
+        plus = rows.nth(idx).locator("[class*=InputNumber_button]").nth(1)
+        for _ in range(int(cfg["passengers"].get(key, 0))):
+            plus.click()
+
+    page.get_by_role("button", name="予約手続きへ").click()
+    page.wait_for_url("**file.sagano.linktivity.io/**", timeout=15000, wait_until="commit")
+    return True
+
+
+STATION_NAMES = {  # 官方選位頁上的站名
+    "saga": "トロッコ嵯峨",
+    "arashiyama": "トロッコ嵐山",
+    "hozukyo": "トロッコ保津峡",
+    "kameoka": "トロッコ亀岡",
+}
+
+
+def select_on_seat_page(page, cfg, chosen: list[Seat]) -> bool:
+    """在官方選位頁照真人流程操作：選車站 → 選班次 → 點座位 → 確認 → 次へ。
+    最後的「次へ」會讓網站自己呼叫確認座位 API，成功後跳到付款頁。"""
+    page.set_default_timeout(15000)
+    combo = page.locator("[role=combobox][tabindex]")
+    combo.first.wait_for()
+    for i, key in enumerate(("from_station", "to_station")):
+        combo.nth(i).click()
+        page.locator("[role=option] button", has_text=STATION_NAMES[cfg[key]]).click()
+
+    time_re = re.compile(rf"^\s*{re.escape(cfg['departure'])}\s*$")
+    page.locator("button[class*=_train_]").filter(has=page.locator("p", has_text=time_re)).first.click()
+    page.get_by_role("button", name="次へ").click()
+
+    current_car = None
+    for st in sorted(chosen, key=lambda s: s.car):
+        if st.car != current_car:  # 展開該節車廂
+            page.locator("button[class*=_carriageContainer_]", has_text=f"{st.car}号車").click()
+            current_car = st.car
+        row = page.locator("[class*=_group_]").filter(
+            has=page.locator("[class*=_groupId_]", has_text=re.compile(rf"^0?{st.row}$")))
+        row.locator("button").filter(
+            has=page.locator("span", has_text=re.compile(rf"^{st.letter}$"))).first.click()
+
+    page.get_by_role("button", name="次へ").click()  # → 座席の確認
+    page.wait_for_url("**currentStep=confirm**", wait_until="commit")
+    page.get_by_role("button", name="次へ").click()  # → 網站確認座位後跳付款頁
+    try:
+        page.wait_for_url("**/booking/pay**", timeout=20000, wait_until="commit")
+    except Exception:
+        print("  確認座位沒有通過（可能剛被別人訂走）")
+        return False
+    return True
+
+
+def load_profile() -> dict:
+    """profile.json（不上傳 GitHub）：{"last_name": "HSU", "first_name": "..."}"""
+    p = ROOT / "profile.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def fill_participant(page, profile: dict) -> bool:
+    """在付款頁「参加者情報」填姓、名（只填欄位，不按確定）。"""
+    if not (profile.get("last_name") and profile.get("first_name")):
+        return False
+    inputs = page.locator("input[type=text]:visible, input:not([type]):visible")
+    inputs.first.wait_for(timeout=15000)
+    for label, value in (("姓", profile["last_name"]), ("名", profile["first_name"])):
+        lab = page.get_by_text(re.compile(rf"^\W*{label}\s*[(（]半角英字")).first
+        box = lab.locator("xpath=following::input[1]")
+        if not box.count():
+            box = inputs.nth(0 if label == "姓" else 1)
+        box.fill(value.upper())
+        box.blur()
+    return True
+
+
+def open_manual_seat_page(page, cfg):
+    """手動備援：一樣先走商品頁（付款頁才有訂票資料），再停在選位頁讓你自己點。"""
+    try:
+        if prepare_booking_session(page, cfg):
+            return
+    except Exception as e:
+        print("  商品頁自動操作失敗：", str(e).splitlines()[0])
+    print("  請在商品頁自己選日期、人數後按「予約手続きへ」。")
+    page.goto(ACTIVITY_URL)
 
 
 # ---------------------------------------------------------------- flow
@@ -239,8 +440,13 @@ def open_browser():
                   viewport={"width": 1100, "height": 900}, locale="ja-JP")
     try:
         ctx = pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
-    except Exception:
-        ctx = pw.chromium.launch_persistent_context(**kwargs)
+    except Exception as chrome_err:
+        try:
+            ctx = pw.chromium.launch_persistent_context(**kwargs)
+        except Exception:
+            pw.stop()
+            sys.exit("無法開啟 Chrome。常見原因：上一次開的瀏覽器視窗還沒關（browser-profile 被占用），"
+                     f"請先關掉再試一次。\n原始錯誤：{chrome_err}")
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return pw, ctx, page
 
@@ -297,15 +503,45 @@ def cmd_run(cfg):
 
     if not res:
         print("時間內沒有搶到符合條件的座位，改開官方選位頁讓你手動選。")
-        page.goto(manual_seat_url(cfg))
+        open_manual_seat_page(page, cfg)
     else:
-        svc, chosen, _ = res
-        print("選定座位：", ", ".join(s.label for s in chosen))
-        url = booking_url(cfg, svc["id"], chosen)
-        page.goto(url)
-        print("\n>>> 已開到付款頁。請在瀏覽器裡確認：日期、班次、座位、人數（大人/小孩），")
-        print(">>> 然後由你自己完成付款。付款完成才算正式訂到座位。")
-        print(">>> 如果頁面顯示錯誤，請改用官方選位頁：", manual_seat_url(cfg))
+        ok = False
+        for attempt in range(1, 4):  # 座位被搶走時重新查詢再試，最多 3 次
+            if attempt > 1:
+                res = try_once(cfg)
+                if not res:
+                    break
+            svc, chosen, _ = res
+            print(f"選定座位（第 {attempt} 次）：", ", ".join(s.label for s in chosen))
+            try:
+                print("  商品頁：選日期、人數…")
+                if not prepare_booking_session(page, cfg):
+                    break
+                if cfg.get("seat_mode", "click") == "direct":
+                    # 商品頁花了幾秒，重查一次確保座位還是空的，再把座位直接帶進付款頁網址
+                    res = try_once(cfg, verbose=False) or res
+                    svc, chosen, _ = res
+                    print("  直接帶座位到付款頁：", ", ".join(s.label for s in chosen))
+                    page.goto(booking_url(cfg, svc["id"], chosen), wait_until="commit")
+                    ok = True
+                else:
+                    print("  選位頁：選班次、點座位…")
+                    ok = select_on_seat_page(page, cfg, chosen)
+            except Exception as e:
+                print("  自動操作失敗：", str(e).splitlines()[0])
+            if ok:
+                break
+        if ok:
+            try:
+                if fill_participant(page, load_profile()):
+                    print("  已填入姓名（profile.json）")
+            except Exception as e:
+                print("  自動填姓名失敗，請自己填：", str(e).splitlines()[0])
+            print("\n>>> 已開到付款頁。請在瀏覽器裡確認：日期、班次、座位、人數（大人/小孩），")
+            print(">>> 然後由你自己勾選同意並完成付款。付款完成才算正式訂到座位。")
+        else:
+            print("\n自動選位沒有成功，改開官方選位頁，請手動選位。")
+            open_manual_seat_page(page, cfg)
     wait_for_close(ctx)
     try:
         ctx.close()

@@ -20,14 +20,28 @@ python -m playwright install chromium   # 已裝 Google Chrome 可略過
 | `from_station` / `to_station` | `saga` / `arashiyama` / `hozukyo` / `kameoka` |
 | `departure` | 出發時間，例如 `09:30`（龜岡→嵐山 嵯峨野2號） |
 | `passengers` | 大人 / 小孩人數（合計 1~8） |
-| `seat_rule` | 只要雙數排、A/D 座位、可接受的車廂、是否優先同車廂 |
+| `seat_mode` | `direct`：座位直接帶進付款頁網址（較快）；`click`：在官方選位頁一個個點座位 |
+| `seat_rule.cars` | 可接受的車廂，例如 `[1,2,3,4]`（不要 5 號車） |
+| `seat_rule.seat_groups` | 每組要在同一排湊齊，例如 `[["A","C","D"],["A","D"]]`；總數要等於人數。沒設定時改用 `seat_letters` |
+| `seat_rule.even_rows_only` | 只要雙數排；搭配 `allow_odd_rows_fallback` 可在湊不齊時改用奇數排 |
+| `seat_rule.allow_any_seats_fallback` | 都湊不齊時改挑任意空位 |
+| `seat_rule.prefer_high_rows` / `car_priority` | 排數越大越好；車廂優先順序，例如 `[4,3,2,1]` |
+
+挑位優先順序：雙數排 > 同一車廂 > 排數越大 > 車廂順序 > 奇數排 > 任意座位。
+
+### 姓名 `profile.json`（不會上傳 GitHub）
+
+```json
+{ "last_name": "YOUR", "first_name": "NAME" }
+```
+有這個檔案時，`run` 開到付款頁會自動填好參加者姓名（只填欄位，不按確定）。
 
 ## 使用
 
 ```powershell
 python bot.py login   # 第一次：自己登入，登入完關掉瀏覽器
 python bot.py check   # 查目前符合條件的座位（不訂票）
-python bot.py run     # 正式：等開賣 → 選位 → 開到付款頁 → 你自己付款
+python bot.py run     # 正式：等開賣 → 選位 → 商品頁自動選日期人數 → 開到付款頁並填好姓名 → 你自己付款
 ```
 
 開賣時間：搭乘日前一個月同一天 **0:00 日本時間**（= 台灣前一天 23:00）。

@@ -2,3 +2,4 @@ browser-profile/
 __pycache__/
 .venv/
 *.log
+profile.json
